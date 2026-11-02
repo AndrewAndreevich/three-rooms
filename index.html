@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Three Rooms</title>
+<meta name="description" content="Scroll to walk back through three rooms, one after another.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500&family=Instrument+Serif&display=swap" rel="stylesheet">
+<style>
+  :root { --bg: #0d0c0b; --fg: #f3efe8; --dim: rgba(243, 239, 232, .55); }
+  * { box-sizing: border-box; margin: 0; }
+  html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(--fg); font: 14px/1.5 Inter, system-ui, sans-serif; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+  .ui { position: fixed; left: 0; right: 0; pointer-events: none; padding: 0 max(16px, 3vw); }
+  header.ui { top: max(16px, 3vw); display: flex; justify-content: space-between; align-items: baseline; }
+  header h1 { font: 400 22px/1 'Instrument Serif', serif; letter-spacing: .01em; }
+  header .count { font-size: 12px; letter-spacing: .14em; color: var(--dim); font-variant-numeric: tabular-nums; }
+  footer.ui { bottom: max(16px, 3vw); display: flex; justify-content: space-between; align-items: flex-end; gap: 16px; }
+  .room { transition: opacity .6s; }
+  .room h2 { font: 400 clamp(32px, 6vw, 72px)/1 'Instrument Serif', serif; }
+  .room p { margin-top: 8px; font-size: 12px; color: var(--dim); pointer-events: auto; }
+  .room a { color: inherit; }
+  .bar { width: 2px; height: 120px; background: rgba(243, 239, 232, .15); position: relative; flex: none; }
+  .bar i { position: absolute; left: 0; right: 0; top: 0; height: calc(var(--p, 0) * 100%); background: var(--fg); }
+  .hint { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); font-size: 12px; letter-spacing: .2em;
+    text-transform: uppercase; color: var(--dim); pointer-events: none; transition: opacity .8s; text-align: center; }
+  .hint b { display: block; font-weight: 400; margin-top: 10px; }
+  .hint.gone { opacity: 0; }
+  .load { position: fixed; left: 0; top: 0; height: 2px; width: calc(var(--p, 0) * 100%); background: var(--fg); transition: opacity .6s; }
+  .load.done { opacity: 0; }
+</style>
+</head>
+<body>
+<canvas id="view"></canvas>
+<div class="load"></div>
+<header class="ui"><h1>Three Rooms</h1><span class="count"></span></header>
+<div class="hint">Loading</div>
+<footer class="ui"><div class="room"><h2></h2><p></p></div><div class="bar"><i></i></div></footer>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/",
+  "@sparkjsdev/spark": "https://cdn.jsdelivr.net/npm/@sparkjsdev/spark@2.4.0/dist/spark.module.js"
+} }
+</script>
+<script type="module">
+// Three Gaussian-splat rooms from superspl.at (see README.md for the authors and licences). Scrolling
+// walks the camera backwards from a room's window until it meets the wall behind; there the next room
+// fades in at its own window, and so on through the three.
+//
+// The camera never moves: each room is placed in front of it by the inverse of the camera's pose in
+// that room, so two rooms, each in its own coordinates, can be shown at once while one hands over to
+// the next.
+import * as THREE from 'three';
+import { SparkRenderer, SplatMesh } from '@sparkjsdev/spark';
+
+const $ = q => document.querySelector(q);
+const QS = new URLSearchParams(location.search), EDIT = QS.has('edit');
+const touch = matchMedia('(pointer: coarse)').matches;
+const canvas = $('#view');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: false });
+renderer.setPixelRatio(Math.min(devicePixelRatio, touch ? 1 : 1.5));
+renderer.setClearColor(0x0d0c0b);
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(70, 1, 0.01, 200);
+scene.add(camera);
+const spark = new SparkRenderer({ renderer, ...(touch && { maxStdDev: 2.4, maxPixelRadius: 200, minAlpha: 2 / 255, minSortIntervalMs: 100 }) });
+scene.add(spark);
+
+// Rooms and their camera paths: start is the pose at the window (position, turn and tilt in degrees),
+// end the point by the wall behind that the camera backs to, looking the same way. Set in the editor (?edit).
+const ROOMS = await fetch(`assets/rooms/rooms.json?t=${Date.now()}`).then(r => r.json());
+const N = ROOMS.length;
+const DOLLY = .82;    // of each room's stretch of scrolling: walking back; the rest hands over to the next room
+
+// Loading: the first room with a progress line, then the others in turn, in the background.
+// Phones get lighter files (about 1.5M splats each) drawn whole; computers the full ones with level of detail.
+const fileOf = r => `assets/rooms/${r.file}${touch ? '_mobile' : ''}.sog`;
+async function download(url, onProgress) {
+  const res = await fetch(url);
+  const total = +res.headers.get('Content-Length') || 0, reader = res.body.getReader(), parts = [];
+  let got = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    parts.push(value); got += value.length;
+    if (total) onProgress?.(got / total);
+  }
+  const out = new Uint8Array(got);
+  let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
+}
+// "flip" turns a room upside down (half a turn about z, as the superspl.at viewer does), so poses copied from there fit.
+const flipQ = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), Math.PI);
+const meshes = [];
+async function load(i, onProgress) {
+  const r = ROOMS[i];
+  const mesh = new SplatMesh({ fileBytes: await download(fileOf(r), onProgress), fileName: fileOf(r).split('/').pop(), lod: !touch });
+  await mesh.initialized;
+  mesh.matrixAutoUpdate = false;
+  mesh.visible = false;
+  scene.add(mesh);
+  return meshes[i] = mesh;
+}
+const loadEl = $('.load'), hint = $('.hint');
+const loading = (async () => {
+  await load(0, p => loadEl.style.setProperty('--p', p.toFixed(3)));
+  loadEl.classList.add('done');
+  hint.innerHTML = touch ? 'Swipe up<b>to walk back</b>' : 'Scroll<b>to walk back</b>';
+  for (let i = 1; i < N; i++) await load(i);
+})();
+
+// The camera's pose in room i at u (0 at the window, 1 at the wall behind), as a matrix in the room's coordinates.
+const ease = t => t * t * (3 - 2 * t);
+const D2R = THREE.MathUtils.degToRad;
+const tmpE = new THREE.Euler(0, 0, 0, 'YXZ'), tmpQ = new THREE.Quaternion(), tmpP = new THREE.Vector3(), ONE = new THREE.Vector3(1, 1, 1);
+function poseOf(r, u, look = { x: 0, y: 0 }, out = new THREE.Matrix4()) {
+  tmpP.fromArray(r.start.p).lerp(tmpP.clone().fromArray(r.end), ease(THREE.MathUtils.clamp(u, 0, 1)));
+  tmpE.set(D2R(r.start.pitch + look.y), D2R(r.start.yaw + look.x), 0);
+  return out.compose(tmpP, tmpQ.setFromEuler(tmpE), ONE);
+}
+const base = r => new THREE.Matrix4().makeRotationFromQuaternion(r.flip ? flipQ : new THREE.Quaternion());
+// Puts room i in front of the fixed camera as seen from pose, at the given opacity.
+function show(i, pose, opacity) {
+  const m = meshes[i];
+  if (!m) return;
+  m.visible = opacity > .001;
+  m.opacity = opacity;
+  m.matrix.copy(pose).invert().multiply(base(ROOMS[i]));
+  m.matrixWorldNeedsUpdate = true;
+}
+
+// Scrolling: P runs from 0 (room 1 at its window) to N - 1 + DOLLY (the last room at its wall).
+const PMAX = N - 1 + DOLLY;
+let P = 0, Pt = 0;
+const ready = i => !!meshes[Math.min(N - 1, i)];
+function push(d) {
+  if (EDIT) return;
+  // Only as far as the rooms are loaded: the scroll waits at a wall until the next one is in.
+  let lim = PMAX;
+  for (let i = 1; i < N; i++) if (!ready(i)) { lim = i - 1 + DOLLY; break; }
+  Pt = THREE.MathUtils.clamp(Pt + d, 0, lim);
+  if (Pt > .02) hint.classList.add('gone');
+}
+addEventListener('wheel', e => { e.preventDefault(); push(e.deltaY * (e.deltaMode ? 0.04 : 0.0007)); }, { passive: false });
+let touchY = null;
+addEventListener('touchstart', e => { touchY = e.touches[0].clientY; }, { passive: true });
+addEventListener('touchmove', e => {
+  if (touchY == null) return;
+  const y = e.touches[0].clientY;
+  push((touchY - y) * 0.0025); touchY = y;
+}, { passive: true });
+addEventListener('touchend', () => { touchY = null; });
+addEventListener('keydown', e => {
+  if (EDIT) return;
+  if (['ArrowDown', 'PageDown', ' '].includes(e.key)) push(.25);
+  if (['ArrowUp', 'PageUp'].includes(e.key)) push(-.25);
+});
+
+// A little look-around with the pointer (computers) so a still room is still alive.
+const lookT = { x: 0, y: 0 }, look = { x: 0, y: 0 };
+addEventListener('pointermove', e => {
+  if (EDIT || e.pointerType !== 'mouse') return;
+  lookT.x = -(e.clientX / innerWidth - .5) * 6;
+  lookT.y = -(e.clientY / innerHeight - .5) * 4;
+});
+
+// Captions.
+const countEl = $('.count'), roomEl = $('.room'), barEl = $('.bar i');
+let captionOf = -1;
+function caption(i) {
+  if (i === captionOf) return;
+  captionOf = i;
+  const r = ROOMS[i];
+  roomEl.style.opacity = 0;
+  setTimeout(() => {
+    countEl.textContent = `${String(i + 1).padStart(2, '0')} / ${String(N).padStart(2, '0')}`;
+    roomEl.querySelector('h2').textContent = r.title;
+    roomEl.querySelector('p').innerHTML = `<a href="${r.url}" target="_blank" rel="noopener">${r.author}</a> · ${r.licence}`;
+    roomEl.style.opacity = 1;
+  }, captionOf === 0 && !countEl.textContent ? 0 : 300);
+}
+caption(0);
+
+function resize() {
+  const w = innerWidth, h = innerHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  // Portrait screens: widen the lens so the room keeps about the same width as on a computer.
+  camera.updateProjectionMatrix();
+}
+addEventListener('resize', resize);
+resize();
+
+const editor = EDIT ? (await import('./editor.js')).default({ ROOMS, meshes, camera, canvas, show, poseOf, loading }) : null;
+
+const poseA = new THREE.Matrix4(), poseB = new THREE.Matrix4();
+let last = performance.now();
+function fovFor(r) {
+  const aspect = camera.aspect;   // keep the horizontal view on narrow screens
+  return aspect >= 1 ? r.fov : Math.min(100, THREE.MathUtils.radToDeg(2 * Math.atan(Math.tan(D2R(r.fov) / 2) / Math.max(aspect, .6))));
+}
+function tick(now) {
+  const dt = Math.min(.1, (now - last) / 1000); last = now;
+  if (editor) { editor.frame(dt, fovFor); renderer.render(scene, camera); return; }
+  P += (Pt - P) * (1 - Math.exp(-dt * 3.5));
+  look.x += (lookT.x - look.x) * (1 - Math.exp(-dt * 2));
+  look.y += (lookT.y - look.y) * (1 - Math.exp(-dt * 2));
+  const i = Math.min(N - 1, Math.floor(P)), u = P - i;
+  const walk = Math.min(1, u / DOLLY), hand = i < N - 1 ? THREE.MathUtils.smoothstep(u, DOLLY, 1) : 0;
+  meshes.forEach(m => m && (m.visible = false));
+  // The hand-over: this room fades out at its wall while the next comes up at its window.
+  show(i, poseOf(ROOMS[i], walk, look, poseA), 1 - hand);
+  if (hand > 0) show(i + 1, poseOf(ROOMS[i + 1], 0, look, poseB), hand);
+  camera.fov = THREE.MathUtils.lerp(fovFor(ROOMS[i]), fovFor(ROOMS[Math.min(N - 1, i + 1)]), hand);
+  camera.updateProjectionMatrix();
+  caption(hand > .5 ? i + 1 : i);
+  barEl.parentElement.style.setProperty('--p', (P / PMAX).toFixed(4));
+  renderer.render(scene, camera);
+}
+renderer.setAnimationLoop(tick);
+// ?edit or ?debug: draw a frame on demand (a hidden browser tab skips animation frames) and jump along the walk.
+if (EDIT || QS.has('debug')) Object.assign(window, { roomsTick: tick, roomsAt: p => { P = Pt = p; hint.classList.add('gone'); } });
+</script>
+</body>
+</html>

@@ -1,0 +1,71 @@
+[
+  {
+    "file": "apartment",
+    "title": "Synthetic Apartment",
+    "author": "argenzio",
+    "url": "https://superspl.at/scene/ab735a47",
+    "licence": "CC BY-NC 4.0",
+    "flip": true,
+    "start": {
+      "p": [
+        -2.1,
+        -0.3,
+        -0.45
+      ],
+      "yaw": 90,
+      "pitch": -3
+    },
+    "end": [
+      5.2,
+      -0.3,
+      -0.7
+    ],
+    "fov": 70
+  },
+  {
+    "file": "counting_house",
+    "title": "Fort Vancouver Counting House",
+    "author": "virtualworldtours",
+    "url": "https://superspl.at/scene/fef9a717",
+    "licence": "CC BY 4.0",
+    "flip": true,
+    "start": {
+      "p": [
+        0.0,
+        0.84,
+        1.6
+      ],
+      "yaw": 180,
+      "pitch": -3
+    },
+    "end": [
+      0.0,
+      0.84,
+      -4.3
+    ],
+    "fov": 70
+  },
+  {
+    "file": "livingroom",
+    "title": "Livingroom",
+    "author": "shehabmekky",
+    "url": "https://superspl.at/scene/4d243600",
+    "licence": "CC BY-NC 4.0",
+    "flip": true,
+    "start": {
+      "p": [
+        0.7,
+        1.35,
+        0.3
+      ],
+      "yaw": 0,
+      "pitch": -4
+    },
+    "end": [
+      0.9,
+      1.4,
+      6.4
+    ],
+    "fov": 70
+  }
+]
