@@ -48,14 +48,15 @@
 </script>
 <script type="module">
 // Three Gaussian-splat rooms from superspl.at (see README.md for the authors and licences). Scrolling
-// walks the camera backwards from a room's window until it meets the wall behind; there the next room
-// fades in at its own window, and so on through the three.
+// walks the camera backwards from a room's window until it meets the wall behind; there the room
+// dissolves from afar into a sphere round the camera that shrinks as the scroll goes on, and the next
+// room grows in at its own window inside a sphere, and so on through the three.
 //
 // The camera never moves: each room is placed in front of it by the inverse of the camera's pose in
 // that room, so two rooms, each in its own coordinates, can be shown at once while one hands over to
 // the next.
 import * as THREE from 'three';
-import { SparkRenderer, SplatMesh } from '@sparkjsdev/spark';
+import { SparkRenderer, SplatMesh, dyno } from '@sparkjsdev/spark';
 
 const $ = q => document.querySelector(q);
 const QS = new URLSearchParams(location.search), EDIT = QS.has('edit');
@@ -97,10 +98,34 @@ async function download(url, onProgress) {
 // "flip" turns a room upside down (half a turn about z, as the superspl.at viewer does), so poses copied from there fit.
 const flipQ = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), Math.PI);
 const meshes = [];
+
+// The sphere, per splat on the GPU, in the room's own coordinates: only splats inside it are drawn, and
+// those near its surface are shrunk so none spills over, with a hair-thin white shell on the surface.
+// Growing from the window it brings a room in; shrinking round the camera it takes the room away from
+// the far end inwards. Past the room (radius over 1e3) it is off.
+const sphereFx = new dyno.Dyno({
+  inTypes: { gsplat: dyno.Gsplat, center: 'vec3', radius: 'float' },
+  outTypes: { gsplat: dyno.Gsplat },
+  statements: ({ inputs: I, outputs: O }) => `
+    ${O.gsplat} = ${I.gsplat};
+    float edge = ${I.radius} - length(${O.gsplat}.center - ${I.center});
+    if (edge < 1e3) {
+      const float LW = 0.03;
+      float line = exp(-pow(edge / LW, 2.0));
+      vec3 sc = edge > 0.0 ? min(${O.gsplat}.scales, vec3(edge * 0.4)) : vec3(0.0);
+      ${O.gsplat}.scales = max(sc, vec3(LW * line));
+      ${O.gsplat}.rgba = vec4(mix(${O.gsplat}.rgba.rgb, vec3(1.0), line), max(${O.gsplat}.rgba.a * step(0.0, edge), line));
+    }`.trim().split('\n'),
+});
+const sphere = [];   // per room: { center, radius } uniforms and the last values sent to the GPU
 async function load(i, onProgress) {
   const r = ROOMS[i];
   const mesh = new SplatMesh({ fileBytes: await download(fileOf(r), onProgress), fileName: fileOf(r).split('/').pop(), lod: !touch });
   await mesh.initialized;
+  const u = sphere[i] = { center: dyno.dynoVec3(new THREE.Vector3()), radius: dyno.dynoFloat(EDIT ? 1e4 : 0), sig: '', at: -1e9 };
+  mesh.objectModifier = dyno.dynoBlock({ gsplat: dyno.Gsplat }, { gsplat: dyno.Gsplat },
+    ({ gsplat }) => ({ gsplat: sphereFx.apply({ gsplat, center: u.center, radius: u.radius }).gsplat }));
+  mesh.updateGenerator();
   mesh.matrixAutoUpdate = false;
   mesh.visible = false;
   scene.add(mesh);
@@ -124,25 +149,45 @@ function poseOf(r, u, look = { x: 0, y: 0 }, out = new THREE.Matrix4()) {
   return out.compose(tmpP, tmpQ.setFromEuler(tmpE), ONE);
 }
 const base = r => new THREE.Matrix4().makeRotationFromQuaternion(r.flip ? flipQ : new THREE.Quaternion());
-// Puts room i in front of the fixed camera as seen from pose, at the given opacity.
-function show(i, pose, opacity) {
+// Puts room i in front of the fixed camera as seen from pose. With a sphere ({ radius, around }: a point
+// in the room's posed coordinates, or the camera when none) only what is inside it shows.
+const sphereAt = new THREE.Vector3();
+function show(i, pose, opacity = 1, fx) {
   const m = meshes[i];
   if (!m) return;
   m.visible = opacity > .001;
   m.opacity = opacity;
   m.matrix.copy(pose).invert().multiply(base(ROOMS[i]));
   m.matrixWorldNeedsUpdate = true;
+  if (!fx) return;
+  const u = sphere[i], R = fx.radius > 1e3 ? 1e4 : fx.radius;
+  (fx.around ? sphereAt.fromArray(fx.around) : sphereAt.setFromMatrixPosition(pose))
+    .applyMatrix4(tmpM.copy(base(ROOMS[i])).invert());
+  m.visible = R > 0;
+  // Re-run the per-splat sphere only when it changed; phones at most 8 times a second.
+  const sig = R >= 1e3 ? 'off' : [R.toFixed(3), sphereAt.x.toFixed(3), sphereAt.y.toFixed(3), sphereAt.z.toFixed(3)].join();
+  const now = performance.now();
+  if (sig !== u.sig && (!touch || now - u.at > 120 || sig === 'off' || R === 0)) {
+    u.sig = sig; u.at = now;
+    u.center.value.copy(sphereAt); u.radius.value = R;
+    m.updateVersion();
+  }
 }
+const tmpM = new THREE.Matrix4();
 
 // Scrolling: P runs from 0 (room 1 at its window) to N - 1 + DOLLY (the last room at its wall).
 const PMAX = N - 1 + DOLLY;
+// Along a room's stretch: the sphere round the camera starts shrinking at GONE_FROM and is gone at
+// GONE_AT; past that the next room grows in at its window, timed (REVEAL seconds), not scrolled.
+const GONE_FROM = DOLLY - .25, GONE_AT = DOLLY + .05, REVEAL = 2.6, SPAN = 9;
+const rev = ROOMS.map(() => 0);   // each room's reveal, 0 to 1
 let P = 0, Pt = 0;
 const ready = i => !!meshes[Math.min(N - 1, i)];
 function push(d) {
   if (EDIT) return;
   // Only as far as the rooms are loaded: the scroll waits at a wall until the next one is in.
   let lim = PMAX;
-  for (let i = 1; i < N; i++) if (!ready(i)) { lim = i - 1 + DOLLY; break; }
+  for (let i = 1; i < N; i++) if (!ready(i)) { lim = i - 1 + GONE_FROM - .01; break; }
   Pt = THREE.MathUtils.clamp(Pt + d, 0, lim);
   if (Pt > .02) hint.classList.add('gone');
 }
@@ -211,20 +256,31 @@ function tick(now) {
   look.x += (lookT.x - look.x) * (1 - Math.exp(-dt * 2));
   look.y += (lookT.y - look.y) * (1 - Math.exp(-dt * 2));
   const i = Math.min(N - 1, Math.floor(P)), u = P - i;
-  const walk = Math.min(1, u / DOLLY), hand = i < N - 1 ? THREE.MathUtils.smoothstep(u, DOLLY, 1) : 0;
+  const walk = Math.min(1, u / DOLLY);
+  const gone = i < N - 1 ? THREE.MathUtils.smoothstep(u, GONE_FROM, GONE_AT) : 0, next = gone >= 1;
+  // Reveals run on the clock: the room in view (and the next once this one is gone) grows in, from a
+  // hair after it has loaded; a room left behind shrinks back quickly round its window.
+  rev.forEach((v, j) => {
+    const want = j === i || (next && j === i + 1);
+    rev[j] = !meshes[j] ? -.15 : THREE.MathUtils.clamp(v + (want ? dt / REVEAL : -dt / .6), -.15, 1);
+  });
+  const revR = v => v >= 1 ? 1e4 : Math.max(0, v) * SPAN * .9 + Math.max(0, v) ** 6 * 40;
   meshes.forEach(m => m && (m.visible = false));
-  // The hand-over: this room fades out at its wall while the next comes up at its window.
-  show(i, poseOf(ROOMS[i], walk, look, poseA), 1 - hand);
-  if (hand > 0) show(i + 1, poseOf(ROOMS[i + 1], 0, look, poseB), hand);
-  camera.fov = THREE.MathUtils.lerp(fovFor(ROOMS[i]), fovFor(ROOMS[Math.min(N - 1, i + 1)]), hand);
+  // This room: in from its window, then away round the camera as it backs to the wall (from afar
+  // inwards, the sphere following the camera); whichever sphere is smaller holds.
+  const r = ROOMS[i], goneR = (1 - gone) * SPAN * 1.3 + (1 - gone) ** 6 * 40, inR = revR(rev[i]);
+  poseOf(r, walk, look, poseA);
+  show(i, poseA, 1, gone > 0 && goneR < inR ? { radius: goneR } : { radius: inR, around: r.start.p });
+  if (i < N - 1 && rev[i + 1] > 0) show(i + 1, poseOf(ROOMS[i + 1], 0, look, poseB), 1, { radius: revR(rev[i + 1]), around: ROOMS[i + 1].start.p });
+  camera.fov = fovFor(ROOMS[next ? i + 1 : i]);
   camera.updateProjectionMatrix();
-  caption(hand > .5 ? i + 1 : i);
+  caption(next ? i + 1 : i);
   barEl.parentElement.style.setProperty('--p', (P / PMAX).toFixed(4));
   renderer.render(scene, camera);
 }
 renderer.setAnimationLoop(tick);
 // ?edit or ?debug: draw a frame on demand (a hidden browser tab skips animation frames) and jump along the walk.
-if (EDIT || QS.has('debug')) Object.assign(window, { roomsTick: tick, roomsAt: p => { P = Pt = p; hint.classList.add('gone'); } });
+if (EDIT || QS.has('debug')) Object.assign(window, { roomsTick: tick, roomsFx: () => ({ rev, sphere: sphere.map(u => u.sig) }), roomsAt: p => { P = Pt = p; hint.classList.add('gone'); } });
 </script>
 </body>
 </html>

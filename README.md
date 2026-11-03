@@ -1,6 +1,6 @@
 # Three Rooms
 
-Scroll to walk backwards through three rooms. In each room the camera starts at the window and backs away from it. When it reaches the wall behind, the next room fades in at its own window.
+Scroll to walk backwards through three rooms. In each room the camera starts at the window and backs away from it. Near the wall behind, the room dissolves from afar into a sphere round the camera that shrinks as you scroll, and the next room grows in at its own window inside a sphere, as on the TSSR site.
 
 The rooms are Gaussian splats, drawn with [Spark](https://sparkjs.dev) 2.4.0 on three.js.
 
